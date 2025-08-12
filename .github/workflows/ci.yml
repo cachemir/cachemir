@@ -76,7 +76,7 @@ jobs:
         
     - name: Upload test results
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: test-results-${{ matrix.os }}-${{ matrix.go-version }}
         path: |
@@ -145,7 +145,7 @@ jobs:
       run: go build -v -o bin/cachemir-client-example cmd/client-example/main.go
       
     - name: Upload build artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: binaries-${{ github.sha }}
         path: bin/
