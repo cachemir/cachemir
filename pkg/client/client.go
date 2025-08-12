@@ -55,7 +55,9 @@
 package client
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -82,10 +84,10 @@ import (
 //	client.Set("user:123", "data", 0)    // May go to server1
 //	client.Set("session:abc", "data", 0) // May go to server2
 type Client struct {
-	config *config.ClientConfig    // Client configuration
-	ring   *hash.ConsistentHash    // Consistent hash ring for node selection
+	config *config.ClientConfig       // Client configuration
+	ring   *hash.ConsistentHash       // Consistent hash ring for node selection
 	pools  map[string]*ConnectionPool // Connection pools per node
-	mu     sync.RWMutex             // Protects the pools map
+	mu     sync.RWMutex               // Protects the pools map
 }
 
 // ConnectionPool manages a pool of connections to a single server node.
@@ -96,11 +98,11 @@ type Client struct {
 // and reuses existing connections when available. Connections are returned
 // to the pool after use for efficient resource utilization.
 type ConnectionPool struct {
-	address     string        // Server address (host:port)
 	connections chan net.Conn // Pool of available connections
-	maxConns    int           // Maximum number of connections
+	address     string        // Server address (host:port)
 	connTimeout time.Duration // Timeout for creating new connections
 	mu          sync.Mutex    // Protects the created counter
+	maxConns    int           // Maximum number of connections
 	created     int           // Number of connections created
 }
 
@@ -127,10 +129,10 @@ type ConnectionPool struct {
 // Returns:
 //   - A new Client instance ready for use
 func New(nodes []string) *Client {
-	config := config.LoadClientConfig()
-	config.Nodes = nodes
-	
-	return NewWithConfig(config)
+	cfg := config.LoadClientConfig()
+	cfg.Nodes = nodes
+
+	return NewWithConfig(cfg)
 }
 
 // NewWithConfig creates a new Client using the provided configuration.
@@ -156,27 +158,27 @@ func New(nodes []string) *Client {
 //
 // Panics:
 //   - If the configuration is invalid (fails validation)
-func NewWithConfig(config *config.ClientConfig) *Client {
-	if err := config.Validate(); err != nil {
+func NewWithConfig(cfg *config.ClientConfig) *Client {
+	if err := cfg.Validate(); err != nil {
 		panic(fmt.Sprintf("invalid client config: %v", err))
 	}
-	
+
 	client := &Client{
-		config: config,
-		ring:   hash.New(config.VirtualNodes),
+		config: cfg,
+		ring:   hash.New(cfg.VirtualNodes),
 		pools:  make(map[string]*ConnectionPool),
 	}
-	
-	for _, node := range config.Nodes {
+
+	for _, node := range cfg.Nodes {
 		client.ring.AddNode(node)
 		client.pools[node] = &ConnectionPool{
 			address:     node,
-			connections: make(chan net.Conn, config.MaxConnsPerNode),
-			maxConns:    config.MaxConnsPerNode,
-			connTimeout: time.Duration(config.ConnTimeout) * time.Second,
+			connections: make(chan net.Conn, cfg.MaxConnsPerNode),
+			maxConns:    cfg.MaxConnsPerNode,
+			connTimeout: time.Duration(cfg.ConnTimeout) * time.Second,
 		}
 	}
-	
+
 	return client
 }
 
@@ -201,7 +203,7 @@ func NewWithConfig(config *config.ClientConfig) *Client {
 func (c *Client) AddNode(address string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	c.ring.AddNode(address)
 	if _, exists := c.pools[address]; !exists {
 		c.pools[address] = &ConnectionPool{
@@ -234,7 +236,7 @@ func (c *Client) AddNode(address string) {
 func (c *Client) RemoveNode(address string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	c.ring.RemoveNode(address)
 	if pool, exists := c.pools[address]; exists {
 		pool.Close()
@@ -252,15 +254,15 @@ func (c *Client) getConnection(key string) (net.Conn, error) {
 	if node == "" {
 		return nil, fmt.Errorf("no available nodes")
 	}
-	
+
 	c.mu.RLock()
 	pool, exists := c.pools[node]
 	c.mu.RUnlock()
-	
+
 	if !exists {
 		return nil, fmt.Errorf("no connection pool for node: %s", node)
 	}
-	
+
 	return pool.Get()
 }
 
@@ -270,18 +272,22 @@ func (c *Client) getConnection(key string) (net.Conn, error) {
 func (c *Client) returnConnection(key string, conn net.Conn) {
 	node := c.ring.GetNode(key)
 	if node == "" {
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing connection: %v", err)
+		}
 		return
 	}
-	
+
 	c.mu.RLock()
 	pool, exists := c.pools[node]
 	c.mu.RUnlock()
-	
+
 	if exists {
 		pool.Put(conn)
 	} else {
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing connection: %v", err)
+		}
 	}
 }
 
@@ -290,41 +296,55 @@ func (c *Client) returnConnection(key string, conn net.Conn) {
 // network errors with retries, and manages connection lifecycle.
 //
 // The method implements the following retry strategy:
-//   1. Determine target node using consistent hashing
-//   2. Get connection from node's connection pool
-//   3. Send command and read response
-//   4. Return connection to pool on success
-//   5. Close connection and retry on failure
-//   6. Return error after exhausting retry attempts
+//  1. Determine target node using consistent hashing
+//  2. Get connection from node's connection pool
+//  3. Send command and read response
+//  4. Return connection to pool on success
+//  5. Close connection and retry on failure
+//  6. Return error after exhausting retry attempts
 func (c *Client) executeCommand(cmd *protocol.Command) (*protocol.Response, error) {
 	var lastErr error
-	
+
 	for attempt := 0; attempt <= c.config.RetryAttempts; attempt++ {
 		conn, err := c.getConnection(cmd.Key)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		
-		conn.SetWriteDeadline(time.Now().Add(time.Duration(c.config.WriteTimeout) * time.Second))
-		if err := protocol.WriteCommand(conn, cmd); err != nil {
-			conn.Close()
-			lastErr = err
+
+		writeDeadline := time.Now().Add(time.Duration(c.config.WriteTimeout) * time.Second)
+		if writeErr := conn.SetWriteDeadline(writeDeadline); writeErr != nil {
+			c.returnConnection(cmd.Key, conn)
+			lastErr = writeErr
 			continue
 		}
-		
-		conn.SetReadDeadline(time.Now().Add(time.Duration(c.config.ReadTimeout) * time.Second))
+		if writeErr := protocol.WriteCommand(conn, cmd); writeErr != nil {
+			if closeErr := conn.Close(); closeErr != nil {
+				log.Printf("Error closing connection: %v", closeErr)
+			}
+			lastErr = writeErr
+			continue
+		}
+
+		readDeadline := time.Now().Add(time.Duration(c.config.ReadTimeout) * time.Second)
+		if readErr := conn.SetReadDeadline(readDeadline); readErr != nil {
+			c.returnConnection(cmd.Key, conn)
+			lastErr = readErr
+			continue
+		}
 		resp, err := protocol.ReadResponse(conn)
 		if err != nil {
-			conn.Close()
+			if closeErr := conn.Close(); closeErr != nil {
+				log.Printf("Error closing connection: %v", closeErr)
+			}
 			lastErr = err
 			continue
 		}
-		
+
 		c.returnConnection(cmd.Key, conn)
 		return resp, nil
 	}
-	
+
 	return nil, fmt.Errorf("command failed after %d attempts: %v", c.config.RetryAttempts+1, lastErr)
 }
 
@@ -348,29 +368,7 @@ func (c *Client) executeCommand(cmd *protocol.Command) (*protocol.Response, erro
 //   - The string value if found
 //   - Error if key doesn't exist or operation fails
 func (c *Client) Get(key string) (string, error) {
-	cmd := &protocol.Command{
-		Type: protocol.CmdGet,
-		Key:  key,
-	}
-	
-	resp, err := c.executeCommand(cmd)
-	if err != nil {
-		return "", err
-	}
-	
-	if resp.Type == protocol.RespNil {
-		return "", fmt.Errorf("key not found")
-	}
-	
-	if resp.Type == protocol.RespError {
-		return "", fmt.Errorf("server error: %s", resp.Error)
-	}
-	
-	if resp.Type != protocol.RespString {
-		return "", fmt.Errorf("unexpected response type")
-	}
-	
-	return resp.Data.(string), nil
+	return c.executeStringCommand(protocol.CmdGet, key, "key not found")
 }
 
 // Set stores a string value with an optional expiration time.
@@ -402,16 +400,16 @@ func (c *Client) Set(key, value string, ttl time.Duration) error {
 		Args: []string{value},
 		TTL:  ttl,
 	}
-	
+
 	resp, err := c.executeCommand(cmd)
 	if err != nil {
 		return err
 	}
-	
+
 	if resp.Type == protocol.RespError {
 		return fmt.Errorf("server error: %s", resp.Error)
 	}
-	
+
 	return nil
 }
 
@@ -436,26 +434,118 @@ func (c *Client) Set(key, value string, ttl time.Duration) error {
 // Returns:
 //   - Boolean indicating if the key was deleted
 //   - Error if the operation fails
-func (c *Client) Del(key string) (bool, error) {
+
+// executeBoolCommand executes a command that returns a boolean result based on int64 response
+func (c *Client) executeBoolCommand(cmdType protocol.CommandType, key string) (bool, error) {
 	cmd := &protocol.Command{
-		Type: protocol.CmdDel,
+		Type: cmdType,
 		Key:  key,
 	}
-	
+
 	resp, err := c.executeCommand(cmd)
 	if err != nil {
 		return false, err
 	}
-	
+
 	if resp.Type == protocol.RespError {
 		return false, fmt.Errorf("server error: %s", resp.Error)
 	}
-	
+
 	if resp.Type != protocol.RespInt {
 		return false, fmt.Errorf("unexpected response type")
 	}
-	
-	return resp.Data.(int64) == 1, nil
+
+	if val, ok := resp.Data.(int64); ok {
+		return val == 1, nil
+	}
+	return false, fmt.Errorf("response data is not an int64")
+}
+
+// executeStringCommand executes a command that returns a string result
+func (c *Client) executeStringCommand(cmdType protocol.CommandType, key, nilErrorMsg string) (string, error) {
+	cmd := &protocol.Command{
+		Type: cmdType,
+		Key:  key,
+	}
+
+	resp, err := c.executeCommand(cmd)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.Type == protocol.RespNil {
+		return "", fmt.Errorf("%s", nilErrorMsg)
+	}
+
+	if resp.Type == protocol.RespError {
+		return "", fmt.Errorf("server error: %s", resp.Error)
+	}
+
+	if resp.Type != protocol.RespString {
+		return "", fmt.Errorf("unexpected response type")
+	}
+
+	if str, ok := resp.Data.(string); ok {
+		return str, nil
+	}
+	return "", fmt.Errorf("response data is not a string")
+}
+
+// executeInt64Command executes a command that returns an int64 result
+func (c *Client) executeInt64Command(cmdType protocol.CommandType, key string) (int64, error) {
+	cmd := &protocol.Command{
+		Type: cmdType,
+		Key:  key,
+	}
+
+	resp, err := c.executeCommand(cmd)
+	if err != nil {
+		return 0, err
+	}
+
+	if resp.Type == protocol.RespError {
+		return 0, fmt.Errorf("server error: %s", resp.Error)
+	}
+
+	if resp.Type != protocol.RespInt {
+		return 0, fmt.Errorf("unexpected response type")
+	}
+
+	if val, ok := resp.Data.(int64); ok {
+		return val, nil
+	}
+	return 0, fmt.Errorf("response data is not an int64")
+}
+
+// executeInt64CommandWithArgs executes a command with arguments that returns an int64 result
+func (c *Client) executeInt64CommandWithArgs(cmdType protocol.CommandType, key string, args []string) (int64, error) {
+	cmd := &protocol.Command{
+		Type: cmdType,
+		Key:  key,
+		Args: args,
+	}
+
+	resp, err := c.executeCommand(cmd)
+	if err != nil {
+		return 0, err
+	}
+
+	if resp.Type == protocol.RespError {
+		return 0, fmt.Errorf("server error: %s", resp.Error)
+	}
+
+	if resp.Type != protocol.RespInt {
+		return 0, fmt.Errorf("unexpected response type")
+	}
+
+	if val, ok := resp.Data.(int64); ok {
+		return val, nil
+	}
+	return 0, fmt.Errorf("response data is not an int64")
+}
+
+func (c *Client) Del(key string) (bool, error) {
+	return c.executeBoolCommand(protocol.CmdDel, key)
 }
 
 // Exists checks if a key exists in the cache.
@@ -480,25 +570,7 @@ func (c *Client) Del(key string) (bool, error) {
 //   - Boolean indicating if the key exists
 //   - Error if the operation fails
 func (c *Client) Exists(key string) (bool, error) {
-	cmd := &protocol.Command{
-		Type: protocol.CmdExists,
-		Key:  key,
-	}
-	
-	resp, err := c.executeCommand(cmd)
-	if err != nil {
-		return false, err
-	}
-	
-	if resp.Type == protocol.RespError {
-		return false, fmt.Errorf("server error: %s", resp.Error)
-	}
-	
-	if resp.Type != protocol.RespInt {
-		return false, fmt.Errorf("unexpected response type")
-	}
-	
-	return resp.Data.(int64) == 1, nil
+	return c.executeBoolCommand(protocol.CmdExists, key)
 }
 
 // Incr increments the integer value of a key by 1.
@@ -522,25 +594,7 @@ func (c *Client) Exists(key string) (bool, error) {
 //   - The new integer value after incrementing
 //   - Error if the key contains a non-integer value or operation fails
 func (c *Client) Incr(key string) (int64, error) {
-	cmd := &protocol.Command{
-		Type: protocol.CmdIncr,
-		Key:  key,
-	}
-	
-	resp, err := c.executeCommand(cmd)
-	if err != nil {
-		return 0, err
-	}
-	
-	if resp.Type == protocol.RespError {
-		return 0, fmt.Errorf("server error: %s", resp.Error)
-	}
-	
-	if resp.Type != protocol.RespInt {
-		return 0, fmt.Errorf("unexpected response type")
-	}
-	
-	return resp.Data.(int64), nil
+	return c.executeInt64Command(protocol.CmdIncr, key)
 }
 
 // Decr decrements the integer value of a key by 1.
@@ -560,25 +614,7 @@ func (c *Client) Incr(key string) (int64, error) {
 //   - The new integer value after decrementing
 //   - Error if the key contains a non-integer value or operation fails
 func (c *Client) Decr(key string) (int64, error) {
-	cmd := &protocol.Command{
-		Type: protocol.CmdDecr,
-		Key:  key,
-	}
-	
-	resp, err := c.executeCommand(cmd)
-	if err != nil {
-		return 0, err
-	}
-	
-	if resp.Type == protocol.RespError {
-		return 0, fmt.Errorf("server error: %s", resp.Error)
-	}
-	
-	if resp.Type != protocol.RespInt {
-		return 0, fmt.Errorf("unexpected response type")
-	}
-	
-	return resp.Data.(int64), nil
+	return c.executeInt64Command(protocol.CmdDecr, key)
 }
 
 // Expire sets a timeout on a key. After the timeout, the key will be automatically deleted.
@@ -605,21 +641,24 @@ func (c *Client) Expire(key string, ttl time.Duration) (bool, error) {
 		Key:  key,
 		TTL:  ttl,
 	}
-	
+
 	resp, err := c.executeCommand(cmd)
 	if err != nil {
 		return false, err
 	}
-	
+
 	if resp.Type == protocol.RespError {
 		return false, fmt.Errorf("server error: %s", resp.Error)
 	}
-	
+
 	if resp.Type != protocol.RespInt {
 		return false, fmt.Errorf("unexpected response type")
 	}
-	
-	return resp.Data.(int64) == 1, nil
+
+	if val, ok := resp.Data.(int64); ok {
+		return val == 1, nil
+	}
+	return false, fmt.Errorf("response data is not an int64")
 }
 
 // TTL returns the remaining time to live of a key.
@@ -653,21 +692,24 @@ func (c *Client) TTL(key string) (time.Duration, error) {
 		Type: protocol.CmdTTL,
 		Key:  key,
 	}
-	
+
 	resp, err := c.executeCommand(cmd)
 	if err != nil {
 		return 0, err
 	}
-	
+
 	if resp.Type == protocol.RespError {
 		return 0, fmt.Errorf("server error: %s", resp.Error)
 	}
-	
+
 	if resp.Type != protocol.RespInt {
 		return 0, fmt.Errorf("unexpected response type")
 	}
-	
-	seconds := resp.Data.(int64)
+
+	seconds, ok := resp.Data.(int64)
+	if !ok {
+		return 0, fmt.Errorf("response data is not an int64")
+	}
 	return time.Duration(seconds) * time.Second, nil
 }
 
@@ -699,25 +741,28 @@ func (c *Client) HGet(key, field string) (string, error) {
 		Key:  key,
 		Args: []string{field},
 	}
-	
+
 	resp, err := c.executeCommand(cmd)
 	if err != nil {
 		return "", err
 	}
-	
+
 	if resp.Type == protocol.RespNil {
 		return "", fmt.Errorf("field not found")
 	}
-	
+
 	if resp.Type == protocol.RespError {
 		return "", fmt.Errorf("server error: %s", resp.Error)
 	}
-	
+
 	if resp.Type != protocol.RespString {
 		return "", fmt.Errorf("unexpected response type")
 	}
-	
-	return resp.Data.(string), nil
+
+	if str, ok := resp.Data.(string); ok {
+		return str, nil
+	}
+	return "", fmt.Errorf("response data is not a string")
 }
 
 // HSet sets the value of a hash field.
@@ -744,16 +789,16 @@ func (c *Client) HSet(key, field, value string) error {
 		Key:  key,
 		Args: []string{field, value},
 	}
-	
+
 	resp, err := c.executeCommand(cmd)
 	if err != nil {
 		return err
 	}
-	
+
 	if resp.Type == protocol.RespError {
 		return fmt.Errorf("server error: %s", resp.Error)
 	}
-	
+
 	return nil
 }
 
@@ -787,29 +832,32 @@ func (c *Client) HGetAll(key string) (map[string]string, error) {
 		Type: protocol.CmdHGetAll,
 		Key:  key,
 	}
-	
+
 	resp, err := c.executeCommand(cmd)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if resp.Type == protocol.RespError {
 		return nil, fmt.Errorf("server error: %s", resp.Error)
 	}
-	
+
 	if resp.Type != protocol.RespArray {
 		return nil, fmt.Errorf("unexpected response type")
 	}
-	
-	arr := resp.Data.([]string)
+
+	arr, ok := resp.Data.([]string)
+	if !ok {
+		return nil, fmt.Errorf("response data is not a string array")
+	}
 	result := make(map[string]string)
-	
+
 	for i := 0; i < len(arr); i += 2 {
 		if i+1 < len(arr) {
 			result[arr[i]] = arr[i+1]
 		}
 	}
-	
+
 	return result, nil
 }
 
@@ -835,26 +883,7 @@ func (c *Client) HGetAll(key string) (map[string]string, error) {
 //   - The new length of the list after insertion
 //   - Error if the operation fails
 func (c *Client) LPush(key string, values ...string) (int64, error) {
-	cmd := &protocol.Command{
-		Type: protocol.CmdLPush,
-		Key:  key,
-		Args: values,
-	}
-	
-	resp, err := c.executeCommand(cmd)
-	if err != nil {
-		return 0, err
-	}
-	
-	if resp.Type == protocol.RespError {
-		return 0, fmt.Errorf("server error: %s", resp.Error)
-	}
-	
-	if resp.Type != protocol.RespInt {
-		return 0, fmt.Errorf("unexpected response type")
-	}
-	
-	return resp.Data.(int64), nil
+	return c.executeInt64CommandWithArgs(protocol.CmdLPush, key, values)
 }
 
 // RPush inserts values at the tail (right) of a list.
@@ -878,26 +907,7 @@ func (c *Client) LPush(key string, values ...string) (int64, error) {
 //   - The new length of the list after insertion
 //   - Error if the operation fails
 func (c *Client) RPush(key string, values ...string) (int64, error) {
-	cmd := &protocol.Command{
-		Type: protocol.CmdRPush,
-		Key:  key,
-		Args: values,
-	}
-	
-	resp, err := c.executeCommand(cmd)
-	if err != nil {
-		return 0, err
-	}
-	
-	if resp.Type == protocol.RespError {
-		return 0, fmt.Errorf("server error: %s", resp.Error)
-	}
-	
-	if resp.Type != protocol.RespInt {
-		return 0, fmt.Errorf("unexpected response type")
-	}
-	
-	return resp.Data.(int64), nil
+	return c.executeInt64CommandWithArgs(protocol.CmdRPush, key, values)
 }
 
 // LPop removes and returns the first element from the head (left) of a list.
@@ -922,29 +932,7 @@ func (c *Client) RPush(key string, values ...string) (int64, error) {
 //   - The first element if successful
 //   - Error if list doesn't exist, is empty, or operation fails
 func (c *Client) LPop(key string) (string, error) {
-	cmd := &protocol.Command{
-		Type: protocol.CmdLPop,
-		Key:  key,
-	}
-	
-	resp, err := c.executeCommand(cmd)
-	if err != nil {
-		return "", err
-	}
-	
-	if resp.Type == protocol.RespNil {
-		return "", fmt.Errorf("list is empty")
-	}
-	
-	if resp.Type == protocol.RespError {
-		return "", fmt.Errorf("server error: %s", resp.Error)
-	}
-	
-	if resp.Type != protocol.RespString {
-		return "", fmt.Errorf("unexpected response type")
-	}
-	
-	return resp.Data.(string), nil
+	return c.executeStringCommand(protocol.CmdLPop, key, "list is empty")
 }
 
 // SAdd adds members to a set.
@@ -969,26 +957,7 @@ func (c *Client) LPop(key string) (string, error) {
 //   - The number of members actually added (excluding duplicates)
 //   - Error if the operation fails
 func (c *Client) SAdd(key string, members ...string) (int64, error) {
-	cmd := &protocol.Command{
-		Type: protocol.CmdSAdd,
-		Key:  key,
-		Args: members,
-	}
-	
-	resp, err := c.executeCommand(cmd)
-	if err != nil {
-		return 0, err
-	}
-	
-	if resp.Type == protocol.RespError {
-		return 0, fmt.Errorf("server error: %s", resp.Error)
-	}
-	
-	if resp.Type != protocol.RespInt {
-		return 0, fmt.Errorf("unexpected response type")
-	}
-	
-	return resp.Data.(int64), nil
+	return c.executeInt64CommandWithArgs(protocol.CmdSAdd, key, members)
 }
 
 // SMembers returns all members of a set.
@@ -1018,21 +987,24 @@ func (c *Client) SMembers(key string) ([]string, error) {
 		Type: protocol.CmdSMembers,
 		Key:  key,
 	}
-	
+
 	resp, err := c.executeCommand(cmd)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if resp.Type == protocol.RespError {
 		return nil, fmt.Errorf("server error: %s", resp.Error)
 	}
-	
+
 	if resp.Type != protocol.RespArray {
 		return nil, fmt.Errorf("unexpected response type")
 	}
-	
-	return resp.Data.([]string), nil
+
+	if arr, ok := resp.Data.([]string); ok {
+		return arr, nil
+	}
+	return nil, fmt.Errorf("response data is not a string array")
 }
 
 // Ping tests connectivity to the cluster.
@@ -1056,16 +1028,16 @@ func (c *Client) Ping() error {
 	cmd := &protocol.Command{
 		Type: protocol.CmdPing,
 	}
-	
+
 	resp, err := c.executeCommand(cmd)
 	if err != nil {
 		return err
 	}
-	
+
 	if resp.Type == protocol.RespError {
 		return fmt.Errorf("server error: %s", resp.Error)
 	}
-	
+
 	return nil
 }
 
@@ -1088,11 +1060,11 @@ func (c *Client) Ping() error {
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	for _, pool := range c.pools {
 		pool.Close()
 	}
-	
+
 	return nil
 }
 
@@ -1108,8 +1080,9 @@ func (cp *ConnectionPool) Get() (net.Conn, error) {
 		if cp.created < cp.maxConns {
 			cp.created++
 			cp.mu.Unlock()
-			
-			conn, err := net.DialTimeout("tcp", cp.address, cp.connTimeout)
+
+			dialer := &net.Dialer{Timeout: cp.connTimeout}
+			conn, err := dialer.DialContext(context.Background(), "tcp", cp.address)
 			if err != nil {
 				cp.mu.Lock()
 				cp.created--
@@ -1119,7 +1092,7 @@ func (cp *ConnectionPool) Get() (net.Conn, error) {
 			return conn, nil
 		}
 		cp.mu.Unlock()
-		
+
 		select {
 		case conn := <-cp.connections:
 			return conn, nil
@@ -1135,7 +1108,9 @@ func (cp *ConnectionPool) Put(conn net.Conn) {
 	select {
 	case cp.connections <- conn:
 	default:
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing connection: %v", err)
+		}
 		cp.mu.Lock()
 		cp.created--
 		cp.mu.Unlock()
@@ -1147,6 +1122,8 @@ func (cp *ConnectionPool) Put(conn net.Conn) {
 func (cp *ConnectionPool) Close() {
 	close(cp.connections)
 	for conn := range cp.connections {
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing connection: %v", err)
+		}
 	}
 }

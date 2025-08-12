@@ -41,10 +41,10 @@ const DefaultVirtualNodes = 150
 // to ensure better key distribution. When nodes are added or removed,
 // only a fraction of keys need to be redistributed.
 type ConsistentHash struct {
-	mu           sync.RWMutex      // Protects all fields
 	ring         map[uint32]string // Hash -> node mapping
-	sortedHashes []uint32          // Sorted hash values for binary search
 	nodes        map[string]bool   // Set of active nodes
+	sortedHashes []uint32          // Sorted hash values for binary search
+	mu           sync.RWMutex      // Protects all fields
 	virtualNodes int               // Number of virtual nodes per physical node
 }
 

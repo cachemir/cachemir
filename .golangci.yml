@@ -1,3 +1,5 @@
+version: "2"
+
 run:
   timeout: 5m
   issues-exit-code: 1
@@ -5,73 +7,25 @@ run:
   modules-download-mode: readonly
 
 output:
-  format: colored-line-number
-  print-issued-lines: true
-  print-linter-name: true
-
-linters-settings:
-  errcheck:
-    check-type-assertions: true
-    check-blank: true
-  
-  govet:
-    check-shadowing: true
-    enable-all: true
-  
-  gocyclo:
-    min-complexity: 15
-  
-  dupl:
-    threshold: 100
-  
-  goconst:
-    min-len: 3
-    min-occurrences: 3
-  
-  misspell:
-    locale: US
-  
-  lll:
-    line-length: 120
-  
-  goimports:
-    local-prefixes: github.com/cachemir/cachemir
-  
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - experimental
-      - opinionated
-      - performance
-      - style
-    disabled-checks:
-      - dupImport
-      - ifElseChain
-      - octalLiteral
-      - whyNoLint
-      - wrapperFunc
+  formats:
+    text:
+      path: stdout
+      colors: true
 
 linters:
   enable:
     - bodyclose
-    - deadcode
     - depguard
     - dogsled
     - dupl
     - errcheck
-    - exportloopref
     - exhaustive
     - funlen
     - gochecknoinits
     - goconst
     - gocritic
     - gocyclo
-    - gofmt
-    - goimports
-    - gomnd
-    - goprintffuncname
     - gosec
-    - gosimple
     - govet
     - ineffassign
     - lll
@@ -81,25 +35,74 @@ linters:
     - nolintlint
     - rowserrcheck
     - staticcheck
-    - structcheck
-    - stylecheck
-    - typecheck
     - unconvert
     - unparam
     - unused
-    - varcheck
     - whitespace
-
-issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - gomnd
-        - funlen
-        - goconst
-    - path: cmd/
-      linters:
-        - gochecknoinits
+    - mnd
+    - goprintffuncname
+    - copyloopvar
   
-  max-issues-per-linter: 0
-  max-same-issues: 0
+  settings:
+    depguard:
+      rules:
+        main:
+          allow:
+            - $gostd
+            - github.com/cachemir/cachemir
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    
+    govet:
+      enable-all: true
+      enable:
+        - shadow
+      disable:
+        - fieldalignment
+    
+    gocyclo:
+      min-complexity: 15
+    
+    dupl:
+      threshold: 100
+    
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+    
+    misspell:
+      locale: US
+    
+    lll:
+      line-length: 120
+    
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+      disabled-checks:
+        - dupImport
+        - ifElseChain
+        - octalLiteral
+        - whyNoLint
+        - wrapperFunc
+  
+  exclusions:
+    rules:
+      - path: '_test\.go'
+        linters:
+          - mnd
+          - funlen
+          - goconst
+      - path: 'cmd/'
+        linters:
+          - gochecknoinits
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

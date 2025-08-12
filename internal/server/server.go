@@ -29,6 +29,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -37,6 +38,14 @@ import (
 
 	"github.com/cachemir/cachemir/pkg/cache"
 	"github.com/cachemir/cachemir/pkg/protocol"
+)
+
+// Server timeout constants
+const (
+	defaultReadTimeoutSecs  = 30
+	defaultWriteTimeoutSecs = 10
+	hashCapacityFactor      = 2
+	minHashFields           = 2
 )
 
 // Server represents a CacheMir cache server instance.
@@ -85,10 +94,10 @@ func New(port int) *Server {
 // Each incoming connection is handled in a separate goroutine for concurrency.
 //
 // The server will:
-//   1. Create a TCP listener on the configured port
-//   2. Accept incoming connections in a loop
-//   3. Spawn a goroutine for each connection to handle commands
-//   4. Continue until Stop() is called or an error occurs
+//  1. Create a TCP listener on the configured port
+//  2. Accept incoming connections in a loop
+//  3. Spawn a goroutine for each connection to handle commands
+//  4. Continue until Stop() is called or an error occurs
 //
 // Example:
 //
@@ -102,21 +111,22 @@ func New(port int) *Server {
 //   - Error if the server fails to start or encounters a fatal error
 func (s *Server) Start() error {
 	addr := fmt.Sprintf(":%d", s.port)
-	listener, err := net.Listen("tcp", addr)
+	lc := net.ListenConfig{}
+	listener, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
-	
+
 	s.listener = listener
 	log.Printf("CacheMir server listening on %s", addr)
-	
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			log.Printf("Failed to accept connection: %v", err)
 			continue
 		}
-		
+
 		go s.handleConnection(conn)
 	}
 }
@@ -143,28 +153,38 @@ func (s *Server) Stop() error {
 
 // handleConnection processes commands from a single client connection.
 // It runs in its own goroutine and handles the complete lifecycle of a connection:
-//   1. Read commands from the client using the binary protocol
-//   2. Execute each command against the cache
-//   3. Send responses back to the client
-//   4. Handle connection errors and cleanup
+//  1. Read commands from the client using the binary protocol
+//  2. Execute each command against the cache
+//  3. Send responses back to the client
+//  4. Handle connection errors and cleanup
 //
 // The connection has timeouts for both reading and writing to prevent
 // hanging connections from consuming resources.
 func (s *Server) handleConnection(conn net.Conn) {
-	defer conn.Close()
-	
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Printf("Error closing connection: %v", err)
+		}
+	}()
+
 	for {
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		
+		if err := conn.SetReadDeadline(time.Now().Add(defaultReadTimeoutSecs * time.Second)); err != nil {
+			log.Printf("Error setting read deadline: %v", err)
+			return
+		}
+
 		cmd, err := protocol.ReadCommand(conn)
 		if err != nil {
 			log.Printf("Failed to read command: %v", err)
 			return
 		}
-		
+
 		resp := s.executeCommand(cmd)
-		
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+
+		if err := conn.SetWriteDeadline(time.Now().Add(defaultWriteTimeoutSecs * time.Second)); err != nil {
+			log.Printf("Error setting write deadline: %v", err)
+			return
+		}
 		if err := protocol.WriteResponse(conn, resp); err != nil {
 			log.Printf("Failed to write response: %v", err)
 			return
@@ -182,63 +202,51 @@ func (s *Server) handleConnection(conn net.Conn) {
 // Returns:
 //   - Response object containing the result or error
 func (s *Server) executeCommand(cmd *protocol.Command) *protocol.Response {
-	switch cmd.Type {
-	case protocol.CmdGet:
-		return s.handleGet(cmd)
-	case protocol.CmdSet:
-		return s.handleSet(cmd)
-	case protocol.CmdDel:
-		return s.handleDel(cmd)
-	case protocol.CmdExists:
-		return s.handleExists(cmd)
-	case protocol.CmdIncr:
-		return s.handleIncr(cmd)
-	case protocol.CmdDecr:
-		return s.handleDecr(cmd)
-	case protocol.CmdIncrBy:
-		return s.handleIncrBy(cmd)
-	case protocol.CmdDecrBy:
-		return s.handleDecrBy(cmd)
-	case protocol.CmdExpire:
-		return s.handleExpire(cmd)
-	case protocol.CmdTTL:
-		return s.handleTTL(cmd)
-	case protocol.CmdPersist:
-		return s.handlePersist(cmd)
-	case protocol.CmdHGet:
-		return s.handleHGet(cmd)
-	case protocol.CmdHSet:
-		return s.handleHSet(cmd)
-	case protocol.CmdHDel:
-		return s.handleHDel(cmd)
-	case protocol.CmdHGetAll:
-		return s.handleHGetAll(cmd)
-	case protocol.CmdLPush:
-		return s.handleLPush(cmd)
-	case protocol.CmdRPush:
-		return s.handleRPush(cmd)
-	case protocol.CmdLPop:
-		return s.handleLPop(cmd)
-	case protocol.CmdRPop:
-		return s.handleRPop(cmd)
-	case protocol.CmdLLen:
-		return s.handleLLen(cmd)
-	case protocol.CmdSAdd:
-		return s.handleSAdd(cmd)
-	case protocol.CmdSRem:
-		return s.handleSRem(cmd)
-	case protocol.CmdSMembers:
-		return s.handleSMembers(cmd)
-	case protocol.CmdSIsMember:
-		return s.handleSIsMember(cmd)
-	case protocol.CmdPing:
-		return &protocol.Response{Type: protocol.RespString, Data: "PONG"}
-	default:
-		return &protocol.Response{
-			Type:  protocol.RespError,
-			Error: fmt.Sprintf("unknown command: %d", cmd.Type),
-		}
+	if handler := s.getCommandHandler(cmd.Type); handler != nil {
+		return handler(cmd)
 	}
+
+	return &protocol.Response{
+		Type:  protocol.RespError,
+		Error: fmt.Sprintf("unknown command: %d", cmd.Type),
+	}
+}
+
+func (s *Server) getCommandHandler(cmdType protocol.CommandType) func(*protocol.Command) *protocol.Response {
+	handlers := map[protocol.CommandType]func(*protocol.Command) *protocol.Response{
+		protocol.CmdGet:       s.handleGet,
+		protocol.CmdSet:       s.handleSet,
+		protocol.CmdDel:       s.handleDel,
+		protocol.CmdExists:    s.handleExists,
+		protocol.CmdIncr:      s.handleIncr,
+		protocol.CmdDecr:      s.handleDecr,
+		protocol.CmdIncrBy:    s.handleIncrBy,
+		protocol.CmdDecrBy:    s.handleDecrBy,
+		protocol.CmdExpire:    s.handleExpire,
+		protocol.CmdTTL:       s.handleTTL,
+		protocol.CmdPersist:   s.handlePersist,
+		protocol.CmdHGet:      s.handleHGet,
+		protocol.CmdHSet:      s.handleHSet,
+		protocol.CmdHDel:      s.handleHDel,
+		protocol.CmdHExists:   s.handleHExists,
+		protocol.CmdHGetAll:   s.handleHGetAll,
+		protocol.CmdLPush:     s.handleLPush,
+		protocol.CmdRPush:     s.handleRPush,
+		protocol.CmdLPop:      s.handleLPop,
+		protocol.CmdRPop:      s.handleRPop,
+		protocol.CmdLLen:      s.handleLLen,
+		protocol.CmdSAdd:      s.handleSAdd,
+		protocol.CmdSRem:      s.handleSRem,
+		protocol.CmdSMembers:  s.handleSMembers,
+		protocol.CmdSIsMember: s.handleSIsMember,
+		protocol.CmdPing:      s.handlePing,
+	}
+
+	return handlers[cmdType]
+}
+
+func (s *Server) handlePing(_ *protocol.Command) *protocol.Response {
+	return &protocol.Response{Type: protocol.RespString, Data: "PONG"}
 }
 
 // handleGet processes GET commands to retrieve string values.
@@ -311,14 +319,14 @@ func (s *Server) handleIncrBy(cmd *protocol.Command) *protocol.Response {
 	if len(cmd.Args) == 0 {
 		return &protocol.Response{Type: protocol.RespError, Error: "INCRBY requires a delta value"}
 	}
-	
+
 	delta := int64(1)
 	if len(cmd.Args) > 0 {
 		if d, err := parseIntArg(cmd.Args[0]); err == nil {
 			delta = d
 		}
 	}
-	
+
 	value, err := s.cache.IncrBy(cmd.Key, delta)
 	if err != nil {
 		return &protocol.Response{Type: protocol.RespError, Error: err.Error()}
@@ -333,14 +341,14 @@ func (s *Server) handleDecrBy(cmd *protocol.Command) *protocol.Response {
 	if len(cmd.Args) == 0 {
 		return &protocol.Response{Type: protocol.RespError, Error: "DECRBY requires a delta value"}
 	}
-	
+
 	delta := int64(1)
 	if len(cmd.Args) > 0 {
 		if d, err := parseIntArg(cmd.Args[0]); err == nil {
 			delta = -d
 		}
 	}
-	
+
 	value, err := s.cache.IncrBy(cmd.Key, delta)
 	if err != nil {
 		return &protocol.Response{Type: protocol.RespError, Error: err.Error()}
@@ -385,7 +393,7 @@ func (s *Server) handleHGet(cmd *protocol.Command) *protocol.Response {
 	if len(cmd.Args) == 0 {
 		return &protocol.Response{Type: protocol.RespError, Error: "HGET requires a field"}
 	}
-	
+
 	value, exists := s.cache.HGet(cmd.Key, cmd.Args[0])
 	if !exists {
 		return &protocol.Response{Type: protocol.RespNil}
@@ -397,10 +405,10 @@ func (s *Server) handleHGet(cmd *protocol.Command) *protocol.Response {
 // Requires both field and value arguments.
 // Returns an OK response on success, or an error if arguments are missing.
 func (s *Server) handleHSet(cmd *protocol.Command) *protocol.Response {
-	if len(cmd.Args) < 2 {
+	if len(cmd.Args) < minHashFields {
 		return &protocol.Response{Type: protocol.RespError, Error: "HSET requires field and value"}
 	}
-	
+
 	s.cache.HSet(cmd.Key, cmd.Args[0], cmd.Args[1])
 	return &protocol.Response{Type: protocol.RespOK}
 }
@@ -411,10 +419,25 @@ func (s *Server) handleHDel(cmd *protocol.Command) *protocol.Response {
 	if len(cmd.Args) == 0 {
 		return &protocol.Response{Type: protocol.RespError, Error: "HDEL requires a field"}
 	}
-	
+
 	deleted := s.cache.HDel(cmd.Key, cmd.Args[0])
 	var result int64 = 0
 	if deleted {
+		result = 1
+	}
+	return &protocol.Response{Type: protocol.RespInt, Data: result}
+}
+
+// handleHExists processes HEXISTS commands to check if a hash field exists.
+// Returns 1 if the field exists, 0 otherwise.
+func (s *Server) handleHExists(cmd *protocol.Command) *protocol.Response {
+	if len(cmd.Args) == 0 {
+		return &protocol.Response{Type: protocol.RespError, Error: "HEXISTS requires a field"}
+	}
+
+	exists := s.cache.HExists(cmd.Key, cmd.Args[0])
+	var result int64 = 0
+	if exists {
 		result = 1
 	}
 	return &protocol.Response{Type: protocol.RespInt, Data: result}
@@ -424,7 +447,7 @@ func (s *Server) handleHDel(cmd *protocol.Command) *protocol.Response {
 // Returns an array containing alternating field names and values.
 func (s *Server) handleHGetAll(cmd *protocol.Command) *protocol.Response {
 	hash := s.cache.HGetAll(cmd.Key)
-	result := make([]string, 0, len(hash)*2)
+	result := make([]string, 0, len(hash)*hashCapacityFactor)
 	for k, v := range hash {
 		result = append(result, k, v)
 	}
@@ -437,7 +460,7 @@ func (s *Server) handleLPush(cmd *protocol.Command) *protocol.Response {
 	if len(cmd.Args) == 0 {
 		return &protocol.Response{Type: protocol.RespError, Error: "LPUSH requires at least one value"}
 	}
-	
+
 	length := s.cache.LPush(cmd.Key, cmd.Args...)
 	return &protocol.Response{Type: protocol.RespInt, Data: int64(length)}
 }
@@ -448,7 +471,7 @@ func (s *Server) handleRPush(cmd *protocol.Command) *protocol.Response {
 	if len(cmd.Args) == 0 {
 		return &protocol.Response{Type: protocol.RespError, Error: "RPUSH requires at least one value"}
 	}
-	
+
 	length := s.cache.RPush(cmd.Key, cmd.Args...)
 	return &protocol.Response{Type: protocol.RespInt, Data: int64(length)}
 }
@@ -486,7 +509,7 @@ func (s *Server) handleSAdd(cmd *protocol.Command) *protocol.Response {
 	if len(cmd.Args) == 0 {
 		return &protocol.Response{Type: protocol.RespError, Error: "SADD requires at least one member"}
 	}
-	
+
 	added := s.cache.SAdd(cmd.Key, cmd.Args...)
 	return &protocol.Response{Type: protocol.RespInt, Data: int64(added)}
 }
@@ -497,7 +520,7 @@ func (s *Server) handleSRem(cmd *protocol.Command) *protocol.Response {
 	if len(cmd.Args) == 0 {
 		return &protocol.Response{Type: protocol.RespError, Error: "SREM requires at least one member"}
 	}
-	
+
 	removed := s.cache.SRem(cmd.Key, cmd.Args...)
 	return &protocol.Response{Type: protocol.RespInt, Data: int64(removed)}
 }
@@ -515,7 +538,7 @@ func (s *Server) handleSIsMember(cmd *protocol.Command) *protocol.Response {
 	if len(cmd.Args) == 0 {
 		return &protocol.Response{Type: protocol.RespError, Error: "SISMEMBER requires a member"}
 	}
-	
+
 	isMember := s.cache.SIsMember(cmd.Key, cmd.Args[0])
 	var result int64 = 0
 	if isMember {
