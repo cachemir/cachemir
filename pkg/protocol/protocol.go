@@ -46,6 +46,19 @@ import (
 	"time"
 )
 
+// Protocol constants
+const (
+	protocolHeaderSize = 4
+	maxUint32Value     = 4294967295
+	maxInt64Value      = 9223372036854775807
+	minArgsForSet      = 3
+	exactArgsForGet    = 2
+	exactArgsForDel    = 2
+	exactArgsForExists = 2
+	exactArgsForIncr   = 2
+	exactArgsForDecr   = 2
+)
+
 // CommandType represents the type of command being executed.
 // Each command type corresponds to a Redis-compatible operation.
 type CommandType uint8
@@ -107,10 +120,10 @@ const (
 //		TTL:  30 * time.Minute,
 //	}
 type Command struct {
-	Type CommandType   // The operation to perform
 	Key  string        // The target key for the operation
-	Args []string      // Command arguments (values, fields, etc.)
 	TTL  time.Duration // Optional time-to-live for expiration
+	Type CommandType   // The operation to perform
+	Args []string      // Command arguments (values, fields, etc.)
 }
 
 // Response represents a server response to a client command.
@@ -123,9 +136,9 @@ type Command struct {
 //		Data: "hello world",
 //	}
 type Response struct {
-	Type  ResponseType // The type of response data
 	Data  interface{}  // The response payload (string, int64, []string, etc.)
 	Error string       // Error message if Type is RespError
+	Type  ResponseType // The type of response data
 }
 
 // Serialize converts a Command into its binary representation for network transmission.
@@ -195,46 +208,78 @@ func DeserializeCommand(data []byte) (*Command, error) {
 	cmd.Type = CommandType(data[offset])
 	offset++
 
-	keyLen, n := binary.Uvarint(data[offset:])
-	if n <= 0 {
-		return nil, fmt.Errorf("invalid key length")
-	}
-	offset += n
-
-	if offset+int(keyLen) > len(data) {
-		return nil, fmt.Errorf("key data truncated")
-	}
-	cmd.Key = string(data[offset : offset+int(keyLen)])
-	offset += int(keyLen)
-
-	argsCount, n := binary.Uvarint(data[offset:])
-	if n <= 0 {
-		return nil, fmt.Errorf("invalid args count")
-	}
-	offset += n
-
-	cmd.Args = make([]string, argsCount)
-	for i := uint64(0); i < argsCount; i++ {
-		argLen, n := binary.Uvarint(data[offset:])
-		if n <= 0 {
-			return nil, fmt.Errorf("invalid arg length")
-		}
-		offset += n
-
-		if offset+int(argLen) > len(data) {
-			return nil, fmt.Errorf("arg data truncated")
-		}
-		cmd.Args[i] = string(data[offset : offset+int(argLen)])
-		offset += int(argLen)
+	var err error
+	cmd.Key, offset, err = deserializeString(data, offset, "key")
+	if err != nil {
+		return nil, err
 	}
 
-	ttlSeconds, n := binary.Uvarint(data[offset:])
-	if n <= 0 {
-		return nil, fmt.Errorf("invalid TTL")
+	cmd.Args, offset, err = deserializeStringSlice(data, offset)
+	if err != nil {
+		return nil, err
 	}
-	cmd.TTL = time.Duration(ttlSeconds) * time.Second
+
+	cmd.TTL, err = deserializeTTL(data, offset)
+	if err != nil {
+		return nil, err
+	}
 
 	return cmd, nil
+}
+
+func deserializeString(data []byte, offset int, fieldName string) (str string, newOffset int, err error) {
+	strLen, n := binary.Uvarint(data[offset:])
+	if n <= 0 {
+		err = fmt.Errorf("invalid %s length", fieldName)
+		return
+	}
+	if strLen > uint64(len(data)) || strLen > uint64(^uint(0)>>1) {
+		err = fmt.Errorf("%s length too large", fieldName)
+		return
+	}
+	offset += n
+
+	strLenInt := int(strLen)
+	if offset+strLenInt > len(data) {
+		err = fmt.Errorf("%s data truncated", fieldName)
+		return
+	}
+	str = string(data[offset : offset+strLenInt])
+	newOffset = offset + strLenInt
+	return
+}
+
+func deserializeStringSlice(data []byte, offset int) (args []string, newOffset int, err error) {
+	argsCount, n := binary.Uvarint(data[offset:])
+	if n <= 0 {
+		err = fmt.Errorf("invalid args count")
+		return
+	}
+	offset += n
+
+	args = make([]string, argsCount)
+	for i := uint64(0); i < argsCount; i++ {
+		var arg string
+		arg, offset, err = deserializeString(data, offset, "arg")
+		if err != nil {
+			return
+		}
+		args[i] = arg
+	}
+
+	newOffset = offset
+	return
+}
+
+func deserializeTTL(data []byte, offset int) (time.Duration, error) {
+	ttlSeconds, n := binary.Uvarint(data[offset:])
+	if n <= 0 {
+		return 0, fmt.Errorf("invalid TTL")
+	}
+	if ttlSeconds > uint64(maxInt64Value) {
+		return 0, fmt.Errorf("TTL too large")
+	}
+	return time.Duration(int64(ttlSeconds)) * time.Second, nil
 }
 
 // Serialize converts a Response into its binary representation for network transmission.
@@ -322,57 +367,51 @@ func DeserializeResponse(data []byte) (*Response, error) {
 	case RespOK, RespNil:
 		return resp, nil
 	case RespError:
-		errorLen, n := binary.Uvarint(data[offset:])
-		if n <= 0 {
-			return nil, fmt.Errorf("invalid error length")
-		}
-		offset += n
-
-		if offset+int(errorLen) > len(data) {
-			return nil, fmt.Errorf("error data truncated")
-		}
-		resp.Error = string(data[offset : offset+int(errorLen)])
+		return deserializeErrorResponse(resp, data, offset)
 	case RespString:
-		strLen, n := binary.Uvarint(data[offset:])
-		if n <= 0 {
-			return nil, fmt.Errorf("invalid string length")
-		}
-		offset += n
-
-		if offset+int(strLen) > len(data) {
-			return nil, fmt.Errorf("string data truncated")
-		}
-		resp.Data = string(data[offset : offset+int(strLen)])
+		return deserializeStringResponse(resp, data, offset)
 	case RespInt:
-		num, n := binary.Varint(data[offset:])
-		if n <= 0 {
-			return nil, fmt.Errorf("invalid integer")
-		}
-		resp.Data = num
+		return deserializeIntResponse(resp, data, offset)
 	case RespArray:
-		arrLen, n := binary.Uvarint(data[offset:])
-		if n <= 0 {
-			return nil, fmt.Errorf("invalid array length")
-		}
-		offset += n
-
-		arr := make([]string, arrLen)
-		for i := uint64(0); i < arrLen; i++ {
-			itemLen, n := binary.Uvarint(data[offset:])
-			if n <= 0 {
-				return nil, fmt.Errorf("invalid item length")
-			}
-			offset += n
-
-			if offset+int(itemLen) > len(data) {
-				return nil, fmt.Errorf("item data truncated")
-			}
-			arr[i] = string(data[offset : offset+int(itemLen)])
-			offset += int(itemLen)
-		}
-		resp.Data = arr
+		return deserializeArrayResponse(resp, data, offset)
 	}
 
+	return resp, nil
+}
+
+func deserializeErrorResponse(resp *Response, data []byte, offset int) (*Response, error) {
+	errorStr, _, err := deserializeString(data, offset, "error")
+	if err != nil {
+		return nil, err
+	}
+	resp.Error = errorStr
+	return resp, nil
+}
+
+func deserializeStringResponse(resp *Response, data []byte, offset int) (*Response, error) {
+	str, _, err := deserializeString(data, offset, "string")
+	if err != nil {
+		return nil, err
+	}
+	resp.Data = str
+	return resp, nil
+}
+
+func deserializeIntResponse(resp *Response, data []byte, offset int) (*Response, error) {
+	num, n := binary.Varint(data[offset:])
+	if n <= 0 {
+		return nil, fmt.Errorf("invalid integer")
+	}
+	resp.Data = num
+	return resp, nil
+}
+
+func deserializeArrayResponse(resp *Response, data []byte, offset int) (*Response, error) {
+	arr, _, err := deserializeStringSlice(data, offset)
+	if err != nil {
+		return nil, err
+	}
+	resp.Data = arr
 	return resp, nil
 }
 
@@ -400,59 +439,86 @@ func ParseTextCommand(line string) (*Command, error) {
 		return nil, fmt.Errorf("empty command")
 	}
 
-	cmd := &Command{}
 	cmdStr := strings.ToUpper(parts[0])
 
 	switch cmdStr {
 	case "GET":
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("GET requires exactly 1 argument")
-		}
-		cmd.Type = CmdGet
-		cmd.Key = parts[1]
+		return parseGetCommand(parts)
 	case "SET":
-		if len(parts) < 3 {
-			return nil, fmt.Errorf("SET requires at least 2 arguments")
-		}
-		cmd.Type = CmdSet
-		cmd.Key = parts[1]
-		cmd.Args = []string{parts[2]}
-		if len(parts) > 3 {
-			if ttl, err := strconv.Atoi(parts[3]); err == nil {
-				cmd.TTL = time.Duration(ttl) * time.Second
-			}
-		}
+		return parseSetCommand(parts)
 	case "DEL":
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("DEL requires exactly 1 argument")
-		}
-		cmd.Type = CmdDel
-		cmd.Key = parts[1]
+		return parseDelCommand(parts)
 	case "EXISTS":
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("EXISTS requires exactly 1 argument")
-		}
-		cmd.Type = CmdExists
-		cmd.Key = parts[1]
+		return parseExistsCommand(parts)
 	case "INCR":
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("INCR requires exactly 1 argument")
-		}
-		cmd.Type = CmdIncr
-		cmd.Key = parts[1]
+		return parseIncrCommand(parts)
 	case "DECR":
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("DECR requires exactly 1 argument")
-		}
-		cmd.Type = CmdDecr
-		cmd.Key = parts[1]
+		return parseDecrCommand(parts)
 	case "PING":
-		cmd.Type = CmdPing
+		return parsePingCommand()
 	default:
 		return nil, fmt.Errorf("unknown command: %s", cmdStr)
 	}
+}
+
+func parseGetCommand(parts []string) (*Command, error) {
+	if len(parts) != exactArgsForGet {
+		return nil, fmt.Errorf("GET requires exactly 1 argument")
+	}
+	return &Command{Type: CmdGet, Key: parts[1]}, nil
+}
+
+func parseSetCommand(parts []string) (*Command, error) {
+	if len(parts) < minArgsForSet {
+		return nil, fmt.Errorf("SET requires at least 2 arguments")
+	}
+
+	cmd := &Command{
+		Type: CmdSet,
+		Key:  parts[1],
+		Args: []string{parts[2]},
+	}
+
+	const maxArgsForSet = 4
+	if len(parts) > maxArgsForSet {
+		if ttl, err := strconv.Atoi(parts[3]); err == nil {
+			cmd.TTL = time.Duration(ttl) * time.Second
+		}
+	}
 
 	return cmd, nil
+}
+
+func parseDelCommand(parts []string) (*Command, error) {
+	if len(parts) != exactArgsForDel {
+		return nil, fmt.Errorf("DEL requires exactly 1 argument")
+	}
+	return &Command{Type: CmdDel, Key: parts[1]}, nil
+}
+
+func parseExistsCommand(parts []string) (*Command, error) {
+	if len(parts) != exactArgsForExists {
+		return nil, fmt.Errorf("EXISTS requires exactly 1 argument")
+	}
+	return &Command{Type: CmdExists, Key: parts[1]}, nil
+}
+
+func parseIncrCommand(parts []string) (*Command, error) {
+	if len(parts) != exactArgsForIncr {
+		return nil, fmt.Errorf("INCR requires exactly 1 argument")
+	}
+	return &Command{Type: CmdIncr, Key: parts[1]}, nil
+}
+
+func parseDecrCommand(parts []string) (*Command, error) {
+	if len(parts) != exactArgsForDecr {
+		return nil, fmt.Errorf("DECR requires exactly 1 argument")
+	}
+	return &Command{Type: CmdDecr, Key: parts[1]}, nil
+}
+
+func parsePingCommand() (*Command, error) {
+	return &Command{Type: CmdPing}, nil
 }
 
 // WriteResponse writes a Response to the given writer with proper framing.
@@ -476,11 +542,15 @@ func WriteResponse(w io.Writer, resp *Response) error {
 		return err
 	}
 
-	length := make([]byte, 4)
-	binary.BigEndian.PutUint32(length, uint32(len(data)))
+	length := make([]byte, protocolHeaderSize)
+	dataLen := len(data)
+	if dataLen > maxUint32Value { // Check for uint32 overflow (max uint32)
+		return fmt.Errorf("data too large")
+	}
+	binary.BigEndian.PutUint32(length, uint32(dataLen))
 
-	if _, err := w.Write(length); err != nil {
-		return err
+	if _, writeErr := w.Write(length); writeErr != nil {
+		return writeErr
 	}
 
 	_, err = w.Write(data)
@@ -506,7 +576,7 @@ func WriteResponse(w io.Writer, resp *Response) error {
 //   - Deserialized Response object
 //   - Error if reading or deserialization fails
 func ReadResponse(r io.Reader) (*Response, error) {
-	lengthBuf := make([]byte, 4)
+	lengthBuf := make([]byte, protocolHeaderSize)
 	if _, err := io.ReadFull(r, lengthBuf); err != nil {
 		return nil, err
 	}
@@ -544,11 +614,15 @@ func WriteCommand(w io.Writer, cmd *Command) error {
 		return err
 	}
 
-	length := make([]byte, 4)
-	binary.BigEndian.PutUint32(length, uint32(len(data)))
+	length := make([]byte, protocolHeaderSize)
+	dataLen := len(data)
+	if dataLen > maxUint32Value { // Check for uint32 overflow (max uint32)
+		return fmt.Errorf("data too large")
+	}
+	binary.BigEndian.PutUint32(length, uint32(dataLen))
 
-	if _, err := w.Write(length); err != nil {
-		return err
+	if _, writeErr := w.Write(length); writeErr != nil {
+		return writeErr
 	}
 
 	_, err = w.Write(data)
@@ -574,7 +648,7 @@ func WriteCommand(w io.Writer, cmd *Command) error {
 //   - Deserialized Command object
 //   - Error if reading or deserialization fails
 func ReadCommand(r io.Reader) (*Command, error) {
-	lengthBuf := make([]byte, 4)
+	lengthBuf := make([]byte, protocolHeaderSize)
 	if _, err := io.ReadFull(r, lengthBuf); err != nil {
 		return nil, err
 	}
