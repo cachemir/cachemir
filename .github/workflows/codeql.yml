@@ -26,22 +26,41 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24'
+        cache: true
+
+    - name: Download dependencies
+      run: go mod download
+
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@v2
+      uses: github/codeql-action/init@v3
       with:
         languages: ${{ matrix.language }}
         queries: security-extended,security-and-quality
-
+        
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
         go-version: '1.21'
-
-    - name: Build
+    - name: Build packages for analysis
       run: |
-        go build ./...
+        # Build all packages except the root module
+        echo "Building pkg packages..."
+        go build ./pkg/...
+        
+        echo "Building internal packages..."
+        go build ./internal/...
+        
+        echo "Building cmd packages..."
+        go build ./cmd/server
+        go build ./cmd/client-example
+        
+        echo "Build completed successfully"
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v2
+      uses: github/codeql-action/analyze@v3
       with:
         category: "/language:${{matrix.language}}"

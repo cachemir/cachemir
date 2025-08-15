@@ -7,8 +7,13 @@ on:
     branches: [ main, develop ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
 env:
-  GO_VERSION: '1.21'
+  GO_VERSION: '1.24'
 
 jobs:
   test:
@@ -30,7 +35,7 @@ jobs:
         cache: true
         
     - name: Cache Go modules
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cache/go-build
@@ -67,8 +72,8 @@ jobs:
       run: go test -bench=. -benchmem ./... | tee benchmark.txt
       
     - name: Upload coverage to Codecov
-      if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.21'
-      uses: codecov/codecov-action@v3
+      if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.24'
+      uses: codecov/codecov-action@v5
       with:
         file: ./coverage.out
         flags: unittests
@@ -76,7 +81,7 @@ jobs:
         
     - name: Upload test results
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: test-results-${{ matrix.os }}-${{ matrix.go-version }}
         path: |
@@ -97,14 +102,18 @@ jobs:
         cache: true
         
     - name: Run golangci-lint
-      uses: golangci/golangci-lint-action@v3
+      uses: golangci/golangci-lint-action@v8
       with:
-        version: latest
+        version: v2.3.1
         args: --timeout=5m
 
   security:
     name: Security Scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -115,14 +124,22 @@ jobs:
         go-version: ${{ env.GO_VERSION }}
         
     - name: Run Gosec Security Scanner
-      uses: securecodewarrior/github-action-gosec@master
+      uses: securego/gosec@v2.22.7
       with:
         args: '-no-fail -fmt sarif -out results.sarif ./...'
         
     - name: Upload SARIF file
-      uses: github/codeql-action/upload-sarif@v2
+      uses: github/codeql-action/upload-sarif@v3
+      if: always() && hashFiles('results.sarif') != ''
       with:
         sarif_file: results.sarif
+        
+    - name: Upload security scan results as artifact
+      uses: actions/upload-artifact@v4
+      if: always() && hashFiles('results.sarif') != ''
+      with:
+        name: security-scan-results
+        path: results.sarif
 
   build:
     name: Build
@@ -145,7 +162,7 @@ jobs:
       run: go build -v -o bin/cachemir-client-example cmd/client-example/main.go
       
     - name: Upload build artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: binaries-${{ github.sha }}
         path: bin/

@@ -60,9 +60,9 @@ const (
 //   - TypeList: []string
 //   - TypeSet: map[string]bool
 type Value struct {
-	Type      ValueType   // The type of data stored
 	Data      interface{} // The actual data (type depends on Type field)
 	ExpiresAt time.Time   // When this value expires (zero means no expiration)
+	Type      ValueType   // The type of data stored
 }
 
 // Cache provides thread-safe in-memory storage with Redis-compatible operations.
@@ -79,8 +79,8 @@ type Value struct {
 //		fmt.Printf("Session data: %s\n", value)
 //	}
 type Cache struct {
-	mu   sync.RWMutex       // Protects the data map
 	data map[string]*Value // The actual cache storage
+	mu   sync.RWMutex      // Protects the data map
 }
 
 // New creates a new Cache instance and starts the background expiration cleanup.
@@ -107,7 +107,7 @@ func New() *Cache {
 func (c *Cache) cleanupExpired() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
-	
+
 	for range ticker.C {
 		c.mu.Lock()
 		now := time.Now()
@@ -146,17 +146,20 @@ func (c *Cache) isExpired(value *Value) bool {
 func (c *Cache) Get(key string) (string, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) {
 		return "", false
 	}
-	
+
 	if value.Type != TypeString {
 		return "", false
 	}
-	
-	return value.Data.(string), true
+
+	if str, ok := value.Data.(string); ok {
+		return str, true
+	}
+	return "", false
 }
 
 // Set stores a string value in the cache with an optional TTL.
@@ -178,16 +181,16 @@ func (c *Cache) Get(key string) (string, bool) {
 func (c *Cache) Set(key, val string, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	value := &Value{
 		Type: TypeString,
 		Data: val,
 	}
-	
+
 	if ttl > 0 {
 		value.ExpiresAt = time.Now().Add(ttl)
 	}
-	
+
 	c.data[key] = value
 }
 
@@ -209,7 +212,7 @@ func (c *Cache) Set(key, val string, ttl time.Duration) {
 func (c *Cache) Del(key string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	_, exists := c.data[key]
 	if exists {
 		delete(c.data, key)
@@ -236,7 +239,7 @@ func (c *Cache) Del(key string) bool {
 func (c *Cache) Exists(key string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) {
 		return false
@@ -312,7 +315,7 @@ func (c *Cache) Decr(key string) (int64, error) {
 func (c *Cache) IncrBy(key string, delta int64) (int64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) {
 		newValue := &Value{
@@ -322,16 +325,20 @@ func (c *Cache) IncrBy(key string, delta int64) (int64, error) {
 		c.data[key] = newValue
 		return delta, nil
 	}
-	
+
 	if value.Type != TypeString {
 		return 0, fmt.Errorf("value is not a string")
 	}
-	
-	current, err := strconv.ParseInt(value.Data.(string), 10, 64)
+
+	str, ok := value.Data.(string)
+	if !ok {
+		return 0, fmt.Errorf("value is not a string")
+	}
+	current, err := strconv.ParseInt(str, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("value is not an integer")
 	}
-	
+
 	newVal := current + delta
 	value.Data = strconv.FormatInt(newVal, 10)
 	return newVal, nil
@@ -356,12 +363,12 @@ func (c *Cache) IncrBy(key string, delta int64) (int64, error) {
 func (c *Cache) Expire(key string, ttl time.Duration) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) {
 		return false
 	}
-	
+
 	value.ExpiresAt = time.Now().Add(ttl)
 	return true
 }
@@ -388,21 +395,21 @@ func (c *Cache) Expire(key string, ttl time.Duration) bool {
 func (c *Cache) TTL(key string) time.Duration {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) {
 		return -2 * time.Second
 	}
-	
+
 	if value.ExpiresAt.IsZero() {
 		return -1 * time.Second
 	}
-	
+
 	remaining := time.Until(value.ExpiresAt)
 	if remaining <= 0 {
 		return -2 * time.Second
 	}
-	
+
 	return remaining
 }
 
@@ -424,12 +431,12 @@ func (c *Cache) TTL(key string) time.Duration {
 func (c *Cache) Persist(key string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) {
 		return false
 	}
-	
+
 	value.ExpiresAt = time.Time{}
 	return true
 }
@@ -455,13 +462,16 @@ func (c *Cache) Persist(key string) bool {
 func (c *Cache) HGet(key, field string) (string, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) || value.Type != TypeHash {
 		return "", false
 	}
-	
-	hash := value.Data.(map[string]string)
+
+	hash, ok := value.Data.(map[string]string)
+	if !ok {
+		return "", false
+	}
 	val, exists := hash[field]
 	return val, exists
 }
@@ -482,7 +492,7 @@ func (c *Cache) HGet(key, field string) (string, bool) {
 func (c *Cache) HSet(key, field, val string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) {
 		value = &Value{
@@ -493,8 +503,11 @@ func (c *Cache) HSet(key, field, val string) {
 	} else if value.Type != TypeHash {
 		return
 	}
-	
-	hash := value.Data.(map[string]string)
+
+	hash, ok := value.Data.(map[string]string)
+	if !ok {
+		return
+	}
 	hash[field] = val
 }
 
@@ -517,19 +530,47 @@ func (c *Cache) HSet(key, field, val string) {
 func (c *Cache) HDel(key, field string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) || value.Type != TypeHash {
 		return false
 	}
-	
-	hash := value.Data.(map[string]string)
+
+	hash, ok := value.Data.(map[string]string)
+	if !ok {
+		return false
+	}
 	_, exists = hash[field]
 	if exists {
 		delete(hash, field)
 		return true
 	}
 	return false
+}
+
+// HExists checks if a field exists in a hash.
+// Returns true if the field exists, false otherwise.
+//
+// Example:
+//
+//	cache.HSet("user:123", "name", "John")
+//	exists := cache.HExists("user:123", "name") // returns true
+//	exists = cache.HExists("user:123", "age")   // returns false
+func (c *Cache) HExists(key, field string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	value, exists := c.data[key]
+	if !exists || c.isExpired(value) || value.Type != TypeHash {
+		return false
+	}
+
+	hash, ok := value.Data.(map[string]string)
+	if !ok {
+		return false
+	}
+	_, exists = hash[field]
+	return exists
 }
 
 // HGetAll returns all fields and values in a hash.
@@ -553,13 +594,16 @@ func (c *Cache) HDel(key, field string) bool {
 func (c *Cache) HGetAll(key string) map[string]string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) || value.Type != TypeHash {
 		return make(map[string]string)
 	}
-	
-	hash := value.Data.(map[string]string)
+
+	hash, ok := value.Data.(map[string]string)
+	if !ok {
+		return make(map[string]string)
+	}
 	result := make(map[string]string, len(hash))
 	for k, v := range hash {
 		result[k] = v
@@ -587,7 +631,7 @@ func (c *Cache) HGetAll(key string) map[string]string {
 func (c *Cache) LPush(key string, values ...string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) {
 		value = &Value{
@@ -598,8 +642,11 @@ func (c *Cache) LPush(key string, values ...string) int {
 	} else if value.Type != TypeList {
 		return 0
 	}
-	
-	list := value.Data.([]string)
+
+	list, ok := value.Data.([]string)
+	if !ok {
+		return 0
+	}
 	for i := len(values) - 1; i >= 0; i-- {
 		list = append([]string{values[i]}, list...)
 	}
@@ -626,7 +673,7 @@ func (c *Cache) LPush(key string, values ...string) int {
 func (c *Cache) RPush(key string, values ...string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) {
 		value = &Value{
@@ -637,8 +684,11 @@ func (c *Cache) RPush(key string, values ...string) int {
 	} else if value.Type != TypeList {
 		return 0
 	}
-	
-	list := value.Data.([]string)
+
+	list, ok := value.Data.([]string)
+	if !ok {
+		return 0
+	}
 	list = append(list, values...)
 	value.Data = list
 	return len(list)
@@ -664,17 +714,20 @@ func (c *Cache) RPush(key string, values ...string) int {
 func (c *Cache) LPop(key string) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) || value.Type != TypeList {
 		return "", false
 	}
-	
-	list := value.Data.([]string)
+
+	list, ok := value.Data.([]string)
+	if !ok {
+		return "", false
+	}
 	if len(list) == 0 {
 		return "", false
 	}
-	
+
 	result := list[0]
 	value.Data = list[1:]
 	return result, true
@@ -700,17 +753,20 @@ func (c *Cache) LPop(key string) (string, bool) {
 func (c *Cache) RPop(key string) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) || value.Type != TypeList {
 		return "", false
 	}
-	
-	list := value.Data.([]string)
+
+	list, ok := value.Data.([]string)
+	if !ok {
+		return "", false
+	}
 	if len(list) == 0 {
 		return "", false
 	}
-	
+
 	result := list[len(list)-1]
 	value.Data = list[:len(list)-1]
 	return result, true
@@ -733,13 +789,16 @@ func (c *Cache) RPop(key string) (string, bool) {
 func (c *Cache) LLen(key string) int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) || value.Type != TypeList {
 		return 0
 	}
-	
-	list := value.Data.([]string)
+
+	list, ok := value.Data.([]string)
+	if !ok {
+		return 0
+	}
 	return len(list)
 }
 
@@ -761,7 +820,7 @@ func (c *Cache) LLen(key string) int {
 func (c *Cache) SAdd(key string, members ...string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) {
 		value = &Value{
@@ -772,8 +831,11 @@ func (c *Cache) SAdd(key string, members ...string) int {
 	} else if value.Type != TypeSet {
 		return 0
 	}
-	
-	set := value.Data.(map[string]bool)
+
+	set, ok := value.Data.(map[string]bool)
+	if !ok {
+		return 0
+	}
 	added := 0
 	for _, member := range members {
 		if !set[member] {
@@ -802,13 +864,16 @@ func (c *Cache) SAdd(key string, members ...string) int {
 func (c *Cache) SRem(key string, members ...string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) || value.Type != TypeSet {
 		return 0
 	}
-	
-	set := value.Data.(map[string]bool)
+
+	set, ok := value.Data.(map[string]bool)
+	if !ok {
+		return 0
+	}
 	removed := 0
 	for _, member := range members {
 		if set[member] {
@@ -837,13 +902,16 @@ func (c *Cache) SRem(key string, members ...string) int {
 func (c *Cache) SMembers(key string) []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) || value.Type != TypeSet {
 		return []string{}
 	}
-	
-	set := value.Data.(map[string]bool)
+
+	set, ok := value.Data.(map[string]bool)
+	if !ok {
+		return []string{}
+	}
 	members := make([]string, 0, len(set))
 	for member := range set {
 		members = append(members, member)
@@ -870,13 +938,16 @@ func (c *Cache) SMembers(key string) []string {
 func (c *Cache) SIsMember(key, member string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	value, exists := c.data[key]
 	if !exists || c.isExpired(value) || value.Type != TypeSet {
 		return false
 	}
-	
-	set := value.Data.(map[string]bool)
+
+	set, ok := value.Data.(map[string]bool)
+	if !ok {
+		return false
+	}
 	return set[member]
 }
 
@@ -896,21 +967,21 @@ func (c *Cache) SIsMember(key, member string) bool {
 //
 // Returns:
 //   - Map containing cache statistics:
-//     - "keys": total number of keys
-//     - "types": map of data type counts
-//     - "expired": number of expired but not yet cleaned up keys
+//   - "keys": total number of keys
+//   - "types": map of data type counts
+//   - "expired": number of expired but not yet cleaned up keys
 func (c *Cache) Stats() map[string]interface{} {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	
+
 	stats := map[string]interface{}{
 		"keys": len(c.data),
 	}
-	
+
 	typeCount := make(map[string]int)
 	expiredCount := 0
 	now := time.Now()
-	
+
 	for _, value := range c.data {
 		switch value.Type {
 		case TypeString:
@@ -922,14 +993,14 @@ func (c *Cache) Stats() map[string]interface{} {
 		case TypeSet:
 			typeCount["set"]++
 		}
-		
+
 		if !value.ExpiresAt.IsZero() && now.After(value.ExpiresAt) {
 			expiredCount++
 		}
 	}
-	
+
 	stats["types"] = typeCount
 	stats["expired"] = expiredCount
-	
+
 	return stats
 }
