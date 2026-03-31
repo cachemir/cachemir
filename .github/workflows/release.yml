@@ -1,197 +1,21 @@
 name: Release
-
 on:
   push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to release (e.g., v1.0.0)'
-        required: true
-        type: string
+    branches:
+      - main
 
 permissions:
   contents: write
-  packages: write
-  actions: read
-
-env:
-  GO_VERSION: '1.24'
+  issues: write
+  pull-requests: write
 
 jobs:
-  create-release:
-    name: Create Release
+  release:
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.get_version.outputs.version }}
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        
-    - name: Get version
-      id: get_version
-      run: |
-        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-        else
-          echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-        fi
-        
-    - name: Generate changelog
-      id: changelog
-      uses: mikepenz/release-changelog-builder-action@v5
-      with:
-        configuration: |
-          {
-            "categories": [
-              {
-                "title": "## 🚀 Features",
-                "labels": ["feature", "enhancement"]
-              },
-              {
-                "title": "## 🐛 Bug Fixes", 
-                "labels": ["bug", "fix"]
-              },
-              {
-                "title": "## 📚 Documentation",
-                "labels": ["documentation"]
-              },
-              {
-                "title": "## 🔧 Maintenance",
-                "labels": ["maintenance", "chore"]
-              }
-            ]
-          }
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        
-    - name: Create Release
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ steps.get_version.outputs.version }}
-        name: cachemir ${{ steps.get_version.outputs.version }}
-        body: |
-          # CacheMir ${{ steps.get_version.outputs.version }}
-          
-          ${{ steps.changelog.outputs.changelog }}
-          
-          ## 📦 Installation
-          
-          ### Docker
-          ```bash
-          docker pull ghcr.io/${{ github.repository }}:${{ steps.get_version.outputs.version }}
-          ```
-          
-          ### Binary
-          Download the appropriate binary for your platform from the assets below.
-          
-          ## 🚀 Quick Start
-          
-          ```bash
-          # Start server
-          ./cachemir-server -port 8080
-          
-          # Use client
-          go get github.com/${{ github.repository }}@${{ steps.get_version.outputs.version }}
-          ```
-        draft: false
-        prerelease: ${{ contains(steps.get_version.outputs.version, '-') }}
-        generate_release_notes: true
-
-  build-binaries:
-    name: Build Binaries
-    runs-on: ubuntu-latest
-    needs: create-release
-    strategy:
-      matrix:
-        goos: [linux, darwin, windows]
-        goarch: [amd64, arm64]
-        exclude:
-          - goos: windows
-            goarch: arm64
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: ${{ env.GO_VERSION }}
-        cache: true
-        
-    - name: Build binary
-      env:
-        GOOS: ${{ matrix.goos }}
-        GOARCH: ${{ matrix.goarch }}
-        CGO_ENABLED: 0
-      run: |
-        mkdir -p dist
-        BINARY_NAME="cachemir-server"
-        if [ "$GOOS" = "windows" ]; then
-          BINARY_NAME="${BINARY_NAME}.exe"
-        fi
-        
-        echo "Building for $GOOS/$GOARCH..."
-        go build -ldflags="-s -w -X main.version=${{ needs.create-release.outputs.version }}" \
-          -o "dist/${BINARY_NAME}" cmd/server/main.go
-          
-        # Create archive
-        cd dist
-        ARCHIVE_NAME="cachemir-${{ needs.create-release.outputs.version }}-${GOOS}-${GOARCH}"
-        if [ "$GOOS" = "windows" ]; then
-          zip "../${ARCHIVE_NAME}.zip" "${BINARY_NAME}"
-          echo "archive_path=./${ARCHIVE_NAME}.zip" >> $GITHUB_ENV
-        else
-          tar -czf "../${ARCHIVE_NAME}.tar.gz" "${BINARY_NAME}"
-          echo "archive_path=./${ARCHIVE_NAME}.tar.gz" >> $GITHUB_ENV
-        fi
-        echo "archive_name=${ARCHIVE_NAME}.${{ matrix.goos == 'windows' && 'zip' || 'tar.gz' }}" >> $GITHUB_ENV
-        
-    - name: Upload Release Asset
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ needs.create-release.outputs.version }}
-        files: ${{ env.archive_path }}
-
-  build-docker:
-    name: Build and Push Docker Image
-    runs-on: ubuntu-latest
-    needs: create-release
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-      
-    - name: Log in to Container Registry
-      uses: docker/login-action@v3
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-        
-    - name: Extract metadata
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: ghcr.io/${{ github.repository }}
-        tags: |
-          type=semver,pattern={{version}},value=${{ needs.create-release.outputs.version }}
-          type=semver,pattern={{major}}.{{minor}},value=${{ needs.create-release.outputs.version }}
-          type=semver,pattern={{major}},value=${{ needs.create-release.outputs.version }}
-          type=raw,value=latest
-          
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        platforms: linux/amd64,linux/arm64
-        push: true
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+      - uses: actions/checkout@v6
+      - uses: dagger/dagger-for-github@v8.3.0
+        with:
+          cal: --token env://GITHUB_TOKEN run --release-type=go --repo-url=github.com/${{ github.repository }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
