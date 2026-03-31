@@ -40,7 +40,11 @@ jobs:
       with:
         languages: ${{ matrix.language }}
         queries: security-extended,security-and-quality
-
+        
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
     - name: Build packages for analysis
       run: |
         # Build all packages except the root module
