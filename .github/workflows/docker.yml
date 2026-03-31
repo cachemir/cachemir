@@ -21,8 +21,7 @@ jobs:
       packages: write
       security-events: write
     outputs:
-      tags: ${{ steps.meta.outputs.tags }}
-      labels: ${{ steps.meta.outputs.labels }}
+      json: ${{ steps.meta.outputs.json }}
     steps:
     - name: Checkout code
       uses: actions/checkout@v6
@@ -53,8 +52,8 @@ jobs:
     
     - name: Debug Info
       run: |
-        echo "Tags: ${{ needs.metadata.outputs.tags }}"
-        echo "Labels: ${{ needs.metadata.outputs.labels }}"
+        echo "Tags: ${{ fromJson(needs.metadata.outputs.json).tags }}"
+        echo "Labels: ${{ fromJson(needs.metadata.outputs.json).labels }}"
         
     - uses: dagger/dagger-for-github@v8.3.0
       env:
