@@ -62,5 +62,5 @@ jobs:
       with:
         version: "latest"
         module: github.com/kdihalas/dagger/go
-        args: --source=. publish --registry=${{ env.REGISTRY }} --imageName=${{ env.IMAGE_NAME }}:latest --username=${{ github.actor }} --password="env://PASSWORD"
+        args: --source=. publish --path=cmd/server/main.go --registry=${{ env.REGISTRY }} --imageName=${{ env.IMAGE_NAME }}:latest --username=${{ github.actor }} --password="env://PASSWORD"
         cloud-token: ${{ secrets.DAGGER_CLOUD_TOKEN }}
