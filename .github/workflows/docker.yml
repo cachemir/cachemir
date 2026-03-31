@@ -23,12 +23,10 @@ jobs:
     outputs:
       json: ${{ steps.meta.outputs.json }}
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v6
-        
+    - uses: actions/checkout@v6
     - name: Extract metadata
       id: meta
-      uses: docker/metadata-action@v5
+      uses: docker/metadata-action@v6
       with:
         images: ${{ env.IMAGE_NAME }}
         tags: |
@@ -47,14 +45,7 @@ jobs:
       contents: read
       packages: write
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v6
-    
-    - name: Debug Info
-      run: |
-        echo "Tags: --image-name ${{ join(fromJson(needs.metadata.outputs.json).tags, ' --image-name ') }}"
-        echo "Labels: ${{ fromJson(needs.metadata.outputs.json).labels }}"
-        
+    - uses: actions/checkout@v6
     - uses: dagger/dagger-for-github@v8.3.0
       env:
         PASSWORD: ${{ secrets.GITHUB_TOKEN }}
@@ -64,3 +55,4 @@ jobs:
         module: github.com/kdihalas/dagger/go
         args: --source=. publish --path=cmd/server/main.go --registry=${{ env.REGISTRY }} $IMAGE_NAMES --username=${{ github.actor }} --password="env://PASSWORD"
         cloud-token: ${{ secrets.DAGGER_CLOUD_TOKEN }}
+        enable-github-summary: true
