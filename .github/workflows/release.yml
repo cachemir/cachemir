@@ -17,7 +17,7 @@ jobs:
       - uses: dagger/dagger-for-github@v8.3.0
         with:
           version: "latest"
-          module: github.com/kdihalas/dagger/go
+          module: github.com/kdihalas/dagger/release-please
           args: --token env://GITHUB_TOKEN run --release-type=go --repo-url=github.com/${{ github.repository }}
           cloud-token: ${{ secrets.DAGGER_CLOUD_TOKEN }}
           enable-github-summary: true
