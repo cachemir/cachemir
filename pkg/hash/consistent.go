@@ -22,9 +22,9 @@
 package hash
 
 import (
-	"crypto/sha256"
 	"fmt"
-	"sort"
+	"hash/fnv"
+	"slices"
 	"sync"
 )
 
@@ -98,9 +98,7 @@ func (c *ConsistentHash) AddNode(node string) {
 		c.ring[hash] = node
 		c.sortedHashes = append(c.sortedHashes, hash)
 	}
-	sort.Slice(c.sortedHashes, func(i, j int) bool {
-		return c.sortedHashes[i] < c.sortedHashes[j]
-	})
+	slices.Sort(c.sortedHashes)
 }
 
 // RemoveNode removes a physical node from the consistent hash ring.
@@ -198,8 +196,14 @@ func (c *ConsistentHash) GetNodes() []string {
 // If no such hash exists, it wraps around to the first hash (index 0).
 // This implements the circular nature of the hash ring.
 func (c *ConsistentHash) search(hash uint32) int {
-	idx := sort.Search(len(c.sortedHashes), func(i int) bool {
-		return c.sortedHashes[i] >= hash
+	idx, _ := slices.BinarySearchFunc(c.sortedHashes, hash, func(a, b uint32) int {
+		if a < b {
+			return -1
+		}
+		if a > b {
+			return 1
+		}
+		return 0
 	})
 	if idx == len(c.sortedHashes) {
 		idx = 0
@@ -207,12 +211,13 @@ func (c *ConsistentHash) search(hash uint32) int {
 	return idx
 }
 
-// hashKey computes a 32-bit hash of the given key using SHA-256.
-// Only the first 4 bytes of the SHA-256 hash are used to create
-// a 32-bit hash value for ring positioning.
+// hashKey computes a 32-bit hash of the given key using FNV-1a.
+// FNV-1a is a non-cryptographic hash with good distribution and
+// significantly lower CPU cost than SHA-256 for routing purposes.
 func (c *ConsistentHash) hashKey(key string) uint32 {
-	h := sha256.Sum256([]byte(key))
-	return uint32(h[0])<<24 | uint32(h[1])<<16 | uint32(h[2])<<8 | uint32(h[3])
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return h.Sum32()
 }
 
 // Stats returns statistics about the current state of the hash ring.
@@ -229,11 +234,11 @@ func (c *ConsistentHash) hashKey(key string) uint32 {
 //   - "nodes": number of physical nodes
 //   - "virtual_nodes": total number of virtual nodes
 //   - "ring_size": size of the sorted hash array
-func (c *ConsistentHash) Stats() map[string]interface{} {
+func (c *ConsistentHash) Stats() map[string]any {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	return map[string]interface{}{
+	return map[string]any{
 		"nodes":         len(c.nodes),
 		"virtual_nodes": len(c.ring),
 		"ring_size":     len(c.sortedHashes),

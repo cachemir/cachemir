@@ -38,6 +38,7 @@
 package protocol
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -136,7 +137,7 @@ type Command struct {
 //		Data: "hello world",
 //	}
 type Response struct {
-	Data  interface{}  // The response payload (string, int64, []string, etc.)
+	Data  any          // The response payload (string, int64, []string, etc.)
 	Error string       // Error message if Type is RespError
 	Type  ResponseType // The type of response data
 }
@@ -258,7 +259,7 @@ func deserializeStringSlice(data []byte, offset int) (args []string, newOffset i
 	offset += n
 
 	args = make([]string, argsCount)
-	for i := uint64(0); i < argsCount; i++ {
+	for i := range argsCount {
 		var arg string
 		arg, offset, err = deserializeString(data, offset, "arg")
 		if err != nil {
@@ -479,8 +480,9 @@ func parseSetCommand(parts []string) (*Command, error) {
 		Args: []string{parts[2]},
 	}
 
+	// Parse optional TTL (4th token): SET key value [ttl_seconds]
 	const maxArgsForSet = 4
-	if len(parts) > maxArgsForSet {
+	if len(parts) >= maxArgsForSet {
 		if ttl, err := strconv.Atoi(parts[3]); err == nil {
 			cmd.TTL = time.Duration(ttl) * time.Second
 		}
@@ -523,7 +525,7 @@ func parsePingCommand() (*Command, error) {
 
 // WriteResponse writes a Response to the given writer with proper framing.
 // The response is serialized and prefixed with a 4-byte length header.
-// This ensures the receiver can read the complete message.
+// Uses a single Write call to minimize syscall overhead.
 //
 // Example:
 //
@@ -541,20 +543,7 @@ func WriteResponse(w io.Writer, resp *Response) error {
 	if err != nil {
 		return err
 	}
-
-	length := make([]byte, protocolHeaderSize)
-	dataLen := len(data)
-	if dataLen > maxUint32Value { // Check for uint32 overflow (max uint32)
-		return fmt.Errorf("data too large")
-	}
-	binary.BigEndian.PutUint32(length, uint32(dataLen))
-
-	if _, writeErr := w.Write(length); writeErr != nil {
-		return writeErr
-	}
-
-	_, err = w.Write(data)
-	return err
+	return writeFramed(w, data)
 }
 
 // ReadResponse reads a Response from the given reader.
@@ -596,6 +585,7 @@ func ReadResponse(r io.Reader) (*Response, error) {
 
 // WriteCommand writes a Command to the given writer with proper framing.
 // The command is serialized and prefixed with a 4-byte length header.
+// Uses a single Write call to minimize syscall overhead.
 //
 // Example:
 //
@@ -613,20 +603,32 @@ func WriteCommand(w io.Writer, cmd *Command) error {
 	if err != nil {
 		return err
 	}
+	return writeFramed(w, data)
+}
 
-	length := make([]byte, protocolHeaderSize)
+// writeFramed writes a length-prefixed payload in a single Write call.
+// The 4-byte big-endian header and payload are combined into one buffer
+// to avoid the overhead of two separate syscalls per message.
+func writeFramed(w io.Writer, data []byte) error {
 	dataLen := len(data)
-	if dataLen > maxUint32Value { // Check for uint32 overflow (max uint32)
-		return fmt.Errorf("data too large")
-	}
-	binary.BigEndian.PutUint32(length, uint32(dataLen))
-
-	if _, writeErr := w.Write(length); writeErr != nil {
-		return writeErr
+	if dataLen > maxUint32Value {
+		return fmt.Errorf("data too large: %d bytes", dataLen)
 	}
 
-	_, err = w.Write(data)
+	// Allocate header + payload in one contiguous buffer.
+	buf := make([]byte, protocolHeaderSize+dataLen)
+	binary.BigEndian.PutUint32(buf, uint32(dataLen))
+	copy(buf[protocolHeaderSize:], data)
+
+	_, err := w.Write(buf)
 	return err
+}
+
+// NewBufferedWriter wraps w in a bufio.Writer for use with WriteCommand/WriteResponse
+// when batching multiple writes before flushing to a network connection.
+// Callers must call Flush() after the last write.
+func NewBufferedWriter(w io.Writer) *bufio.Writer {
+	return bufio.NewWriter(w)
 }
 
 // ReadCommand reads a Command from the given reader.

@@ -64,9 +64,11 @@ const (
 //	// Later, to stop the server
 //	server.Stop()
 type Server struct {
-	cache    *cache.Cache // The underlying cache engine
-	listener net.Listener // TCP listener for incoming connections
-	port     int          // Port number to listen on
+	cache    *cache.Cache                                                          // The underlying cache engine
+	listener net.Listener                                                          // TCP listener for incoming connections
+	handlers map[protocol.CommandType]func(*protocol.Command) *protocol.Response  // Pre-built dispatch table
+	done     chan struct{}                                                          // Closed when Stop is called
+	port     int                                                                   // Port number to listen on
 }
 
 // New creates a new Server instance that will listen on the specified port.
@@ -83,10 +85,40 @@ type Server struct {
 // Returns:
 //   - A new Server instance ready to be started
 func New(port int) *Server {
-	return &Server{
+	s := &Server{
 		cache: cache.New(),
 		port:  port,
+		done:  make(chan struct{}),
 	}
+	s.handlers = map[protocol.CommandType]func(*protocol.Command) *protocol.Response{
+		protocol.CmdGet:       s.handleGet,
+		protocol.CmdSet:       s.handleSet,
+		protocol.CmdDel:       s.handleDel,
+		protocol.CmdExists:    s.handleExists,
+		protocol.CmdIncr:      s.handleIncr,
+		protocol.CmdDecr:      s.handleDecr,
+		protocol.CmdIncrBy:    s.handleIncrBy,
+		protocol.CmdDecrBy:    s.handleDecrBy,
+		protocol.CmdExpire:    s.handleExpire,
+		protocol.CmdTTL:       s.handleTTL,
+		protocol.CmdPersist:   s.handlePersist,
+		protocol.CmdHGet:      s.handleHGet,
+		protocol.CmdHSet:      s.handleHSet,
+		protocol.CmdHDel:      s.handleHDel,
+		protocol.CmdHExists:   s.handleHExists,
+		protocol.CmdHGetAll:   s.handleHGetAll,
+		protocol.CmdLPush:     s.handleLPush,
+		protocol.CmdRPush:     s.handleRPush,
+		protocol.CmdLPop:      s.handleLPop,
+		protocol.CmdRPop:      s.handleRPop,
+		protocol.CmdLLen:      s.handleLLen,
+		protocol.CmdSAdd:      s.handleSAdd,
+		protocol.CmdSRem:      s.handleSRem,
+		protocol.CmdSMembers:  s.handleSMembers,
+		protocol.CmdSIsMember: s.handleSIsMember,
+		protocol.CmdPing:      s.handlePing,
+	}
+	return s
 }
 
 // Start begins listening for TCP connections and processing commands.
@@ -123,8 +155,13 @@ func (s *Server) Start() error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Failed to accept connection: %v", err)
-			continue
+			// Distinguish between a clean shutdown and a real error.
+			select {
+			case <-s.done:
+				return nil
+			default:
+				return fmt.Errorf("accept error: %w", err)
+			}
 		}
 
 		go s.handleConnection(conn)
@@ -144,7 +181,17 @@ func (s *Server) Start() error {
 //
 // Returns:
 //   - Error if there was a problem closing the listener
+// Stop gracefully shuts down the server by closing the TCP listener.
+// This will cause Start() to return and stop accepting new connections.
+// Also closes the underlying cache to stop the cleanup goroutine.
 func (s *Server) Stop() error {
+	select {
+	case <-s.done:
+		// already stopped
+	default:
+		close(s.done)
+	}
+	s.cache.Close()
 	if s.listener != nil {
 		return s.listener.Close()
 	}
@@ -192,57 +239,16 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 }
 
-// executeCommand processes a single command and returns the appropriate response.
-// It acts as a dispatcher, routing commands to their specific handler methods
-// based on the command type. Unknown commands return an error response.
-//
-// Parameters:
-//   - cmd: The command to execute
-//
-// Returns:
-//   - Response object containing the result or error
+// executeCommand dispatches a command to its handler using the pre-built table.
+// Unknown commands return an error response without a map allocation.
 func (s *Server) executeCommand(cmd *protocol.Command) *protocol.Response {
-	if handler := s.getCommandHandler(cmd.Type); handler != nil {
+	if handler, ok := s.handlers[cmd.Type]; ok {
 		return handler(cmd)
 	}
-
 	return &protocol.Response{
 		Type:  protocol.RespError,
 		Error: fmt.Sprintf("unknown command: %d", cmd.Type),
 	}
-}
-
-func (s *Server) getCommandHandler(cmdType protocol.CommandType) func(*protocol.Command) *protocol.Response {
-	handlers := map[protocol.CommandType]func(*protocol.Command) *protocol.Response{
-		protocol.CmdGet:       s.handleGet,
-		protocol.CmdSet:       s.handleSet,
-		protocol.CmdDel:       s.handleDel,
-		protocol.CmdExists:    s.handleExists,
-		protocol.CmdIncr:      s.handleIncr,
-		protocol.CmdDecr:      s.handleDecr,
-		protocol.CmdIncrBy:    s.handleIncrBy,
-		protocol.CmdDecrBy:    s.handleDecrBy,
-		protocol.CmdExpire:    s.handleExpire,
-		protocol.CmdTTL:       s.handleTTL,
-		protocol.CmdPersist:   s.handlePersist,
-		protocol.CmdHGet:      s.handleHGet,
-		protocol.CmdHSet:      s.handleHSet,
-		protocol.CmdHDel:      s.handleHDel,
-		protocol.CmdHExists:   s.handleHExists,
-		protocol.CmdHGetAll:   s.handleHGetAll,
-		protocol.CmdLPush:     s.handleLPush,
-		protocol.CmdRPush:     s.handleRPush,
-		protocol.CmdLPop:      s.handleLPop,
-		protocol.CmdRPop:      s.handleRPop,
-		protocol.CmdLLen:      s.handleLLen,
-		protocol.CmdSAdd:      s.handleSAdd,
-		protocol.CmdSRem:      s.handleSRem,
-		protocol.CmdSMembers:  s.handleSMembers,
-		protocol.CmdSIsMember: s.handleSIsMember,
-		protocol.CmdPing:      s.handlePing,
-	}
-
-	return handlers[cmdType]
 }
 
 func (s *Server) handlePing(_ *protocol.Command) *protocol.Response {
