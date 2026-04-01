@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/cachemir/cachemir/compare/v0.2.0...v0.3.0) (2026-04-01)
+
+
+### Features
+
+* optimizations ([cd689bb](https://github.com/cachemir/cachemir/commit/cd689bbcf297d1688b13473b2407b06a601c5c02))
+
 ## [0.2.0](https://github.com/cachemir/cachemir/compare/v0.1.0...v0.2.0) (2026-04-01)
 
 
