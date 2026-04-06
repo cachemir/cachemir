@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dagger/dagger-for-github@v8.3.0
+      - uses: dagger/dagger-for-github@v8.4.1
         with:
           version: "latest"
           module: github.com/kdihalas/dagger/release-please
